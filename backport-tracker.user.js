@@ -9,7 +9,15 @@
 // @run-at       document-end
 // @updateURL    https://raw.githubusercontent.com/houmkh/tampermonkey-backport-tracker/master/backport-tracker.user.js
 // @downloadURL  https://raw.githubusercontent.com/houmkh/tampermonkey-backport-tracker/master/backport-tracker.user.js
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // ==/UserScript==
+
+GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
+    const pat = prompt('Enter GitHub PAT (actions:write scope):');
+    if (pat) GM_setValue('github_pat', pat);
+});
 
 (function () {
     'use strict';
@@ -420,15 +428,23 @@
 
             const jsonData = await apiResp.json();
             let foundChecks = [];
+            let workflowRunIds = new Set();
 
             if (jsonData && Array.isArray(jsonData.statusChecks)) {
                 jsonData.statusChecks.forEach(check => {
                     const st = check.conclusion || check.state || "";
                     if (check.displayName && st) {
                         foundChecks.push({ name: check.displayName.toLowerCase(), state: st.toUpperCase(), url: check.targetUrl || null });
+                        // Extract run ID from targetUrl: /repos/owner/repo/actions/runs/12345/jobs/...
+                        if (check.targetUrl) {
+                            const runMatch = check.targetUrl.match(/\/actions\/runs\/(\d+)/);
+                            if (runMatch) workflowRunIds.add(runMatch[1]);
+                        }
                     }
                 });
             }
+
+            result.workflowRunIds = [...workflowRunIds];
 
             if (foundChecks.length > 0) {
                 let run = 0, fail = 0, pass = 0;
@@ -538,7 +554,7 @@
     //   2. Timeline "mentioned this pull request" / "referenced this pull request" events
     // =====================================================================
     function findLinkedPRsFromPage(originalPrNumber) {
-        const seen    = new Map();
+        const seen = new Map();
         const results = [];
 
         const add = (url, branch, backportHint = false) => {
@@ -624,7 +640,7 @@
     // =====================================================================
     async function fetchBackportPRsFromSearch(repo, originalPrNumber) {
         const BRANCH_FROM_TITLE = /\[backport\s*(?:(?:->|→|:)\s*)?([\w.\-\/]+)\]/i;
-        const seen    = new Set();
+        const seen = new Set();
         const results = [];
 
         const parsePage = (html) => {
@@ -659,6 +675,37 @@
 
         if (DEBUG) console.log(`${PREFIX} search fallback found ${results.length} backport PR(s)`);
         return results;
+    }
+
+    async function rerunWorkflow(repo, runId, failedOnly = true) {
+        const endpoint = failedOnly
+        ? `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`
+        : `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun`;
+        // GitHub session-based fetch (works because you're on github.com)
+        const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+        const csrf = csrfMeta ? csrfMeta.content : '';
+        const resp = await fetch(`https://github.com/${repo}/actions/runs/${runId}/rerun`, {
+            method: 'POST',
+            headers: {
+                'Accept': 'text/html',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-Token': csrf,
+            },
+        });
+        if (!resp.ok) {
+            // Fallback: use the GitHub API with a PAT if session auth fails
+            // You can store a PAT in GM_getValue/GM_setValue
+            const token = await GM_getValue('github_pat', '');
+            if (!token) throw new Error('No auth available. Set a PAT via script settings.');
+            const apiResp = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `token ${token}`,
+                    'Accept': 'application/vnd.github+json',
+                },
+            });
+            if (!apiResp.ok) throw new Error(`API returned ${apiResp.status}`);
+        }
     }
 
     function findOriginalPrInCommentRoot(commentRoot, repo, currentPrNumber) {
@@ -1108,6 +1155,40 @@
 
                 statusWrap.appendChild(statusBadge);
                 statusWrap.appendChild(statusIcon);
+
+                // ── Restart CI button ──────────────────────────────
+                if (pr.workflowRunIds && pr.workflowRunIds.length > 0 &&
+                    (pr.ciStatus === 'test_fail' || pr.ciStatus === 'error' || pr.ciStatus === 'pending')) {
+                    const restartBtn = document.createElement('button');
+                    restartBtn.className = 'btn-link color-fg-muted';
+                    restartBtn.type = 'button';
+                    restartBtn.style.cssText = 'background:none;border:none;padding:0 2px;cursor:pointer;line-height:0;';
+                    restartBtn.title = pr.ciStatus === 'test_fail' ? 'Re-run failed jobs' : 'Re-run all jobs';
+                    restartBtn.innerHTML = OCTICONS.sync;
+                    restartBtn.addEventListener('click', async (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        restartBtn.querySelector('svg').classList.add('anim-rotate');
+                        restartBtn.style.pointerEvents = 'none';
+                        try {
+                            const parsed = parseGithubUrl(pr.url);
+                            const repo = parsed ? parsed.repo : '';
+                            const failedOnly = pr.ciStatus === 'test_fail';
+                            // Rerun the most recent workflow run
+                            await rerunWorkflow(repo, pr.workflowRunIds[0], failedOnly);
+                            restartBtn.title = 'Triggered!';
+                            setTimeout(() => { restartBtn.title = 'Re-run'; }, 2000);
+                        } catch (e) {
+                            restartBtn.title = `Failed: ${e.message}`;
+                        } finally {
+                            restartBtn.querySelector('svg').classList.remove('anim-rotate');
+                            restartBtn.style.pointerEvents = '';
+                        }
+                    });
+                    statusWrap.appendChild(restartBtn);
+                }
+                // ───────────────────────────────────────────────────
+
                 iconDiv.appendChild(statusWrap);
             }
 
