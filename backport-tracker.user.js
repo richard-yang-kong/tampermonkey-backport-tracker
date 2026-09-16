@@ -504,8 +504,11 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 const managerApproved = hasManagerCheck && hasApprovedManagerCheck && !hasPendingManagerCheck;
                 const managerStatus = !hasManagerCheck ? 'Not required' : (managerApproved ? 'Approved' : 'Waiting MA');
 
-                if (fail > 0) result.ciStatus = 'test_fail';
-                else if (run > 0) result.ciStatus = 'pending';
+                // Running jobs outrank failed ones: while any job is still queued
+                // or in progress the result is not final, and GitHub refuses to
+                // rerun a run that has not completed.
+                if (run > 0) result.ciStatus = 'pending';
+                else if (fail > 0) result.ciStatus = 'test_fail';
                 else if (hasManagerCheck && !managerApproved) result.ciStatus = 'ma_pending';
                 else result.ciStatus = 'success';
 
