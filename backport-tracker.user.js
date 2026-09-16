@@ -1279,7 +1279,8 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 // icon itself reruns it, instead of a separate adjacent button.
                 const canRestart = pr.workflowRunIds && pr.workflowRunIds.length > 0 &&
                     (pr.ciStatus === 'test_fail' || pr.ciStatus === 'error' || pr.ciStatus === 'pending');
-                const iconLabel = pr.ciStatus === 'test_fail' ? 'Re-run failed jobs' : 'Re-run all jobs';
+                const failedOnly = pr.ciStatus === 'test_fail';
+                const iconLabel = failedOnly ? 'Re-run failed jobs' : 'Re-run all jobs';
 
                 const statusIcon = document.createElement(canRestart ? 'button' : 'span');
                 statusIcon.className = 'd-flex flex-items-center';
@@ -1292,12 +1293,24 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     statusIcon.addEventListener('click', async (event) => {
                         event.preventDefault();
                         event.stopPropagation();
+
+                        // A full re-run restarts every job in the suite, so it
+                        // both costs a lot of CI time and throws away results
+                        // that are still valid. Ask before doing that. Re-running
+                        // only the failed jobs is cheap and needs no prompt.
+                        if (!failedOnly) {
+                            const confirmed = window.confirm(
+                                `Re-run ALL jobs of #${pr.id} (${pr.branch})?\n\n`
+                                + 'This restarts every job in the run, including the ones that already passed.'
+                            );
+                            if (!confirmed) return;
+                        }
+
                         statusIcon.querySelector('svg').classList.add('anim-rotate');
                         statusIcon.style.pointerEvents = 'none';
                         try {
                             const parsed = parseGithubUrl(pr.url);
                             const repo = parsed ? parsed.repo : '';
-                            const failedOnly = pr.ciStatus === 'test_fail';
                             // A PR usually spreads its checks over several workflow
                             // runs, so rerun every affected run, not just the first.
                             const runIds = failedOnly && pr.failedWorkflowRunIds && pr.failedWorkflowRunIds.length > 0
