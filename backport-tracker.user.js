@@ -338,6 +338,27 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         }
     }
 
+    // Recursively scan a status-check object for any GitHub Actions run ID,
+    // regardless of which field it's nested under (targetUrl, detailsUrl, a
+    // nested workflow-run object, ...) — GitHub's internal payload shape has
+    // shifted across UI versions, so a single fixed field name is not reliable.
+    function findWorkflowRunIdsInValue(value, seen = new Set()) {
+        const found = [];
+        if (typeof value === 'string') {
+            const m = value.match(/\/actions\/runs\/(\d+)/);
+            if (m) found.push(m[1]);
+        } else if (value && typeof value === 'object') {
+            if (seen.has(value)) return found;
+            seen.add(value);
+            for (const key in value) {
+                if (Object.prototype.hasOwnProperty.call(value, key)) {
+                    found.push(...findWorkflowRunIdsInValue(value[key], seen));
+                }
+            }
+        }
+        return found;
+    }
+
     // =====================================================================
     // Fetch PR state + CI status (unchanged from original)
     // =====================================================================
@@ -435,10 +456,11 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     const st = check.conclusion || check.state || "";
                     if (check.displayName && st) {
                         foundChecks.push({ name: check.displayName.toLowerCase(), state: st.toUpperCase(), url: check.targetUrl || null });
-                        // Extract run ID from targetUrl: /repos/owner/repo/actions/runs/12345/jobs/...
-                        if (check.targetUrl) {
-                            const runMatch = check.targetUrl.match(/\/actions\/runs\/(\d+)/);
-                            if (runMatch) workflowRunIds.add(runMatch[1]);
+                        // Run IDs can show up under different field names across GitHub UI
+                        // versions (targetUrl, detailsUrl, nested workflow-run objects, ...),
+                        // so scan every string in the check rather than one fixed field.
+                        for (const runId of findWorkflowRunIdsInValue(check)) {
+                            workflowRunIds.add(runId);
                         }
                     }
                 });
@@ -1150,46 +1172,46 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 statusBadge.textContent = getOpenPrStatusLabel(pr.ciStatus);
                 statusBadge.style.cssText = getOpenPrStatusBadgeStyle(pr.ciStatus);
 
-                const statusIcon = document.createElement('span');
+                // The status icon (the red X on failure, the alert triangle on
+                // error, the amber dot while pending) doubles as the rerun
+                // trigger when we have a workflow run to target — clicking the
+                // icon itself reruns it, instead of a separate adjacent button.
+                const canRestart = pr.workflowRunIds && pr.workflowRunIds.length > 0 &&
+                    (pr.ciStatus === 'test_fail' || pr.ciStatus === 'error' || pr.ciStatus === 'pending');
+                const iconLabel = pr.ciStatus === 'test_fail' ? 'Re-run failed jobs' : 'Re-run all jobs';
+
+                const statusIcon = document.createElement(canRestart ? 'button' : 'span');
                 statusIcon.className = 'd-flex flex-items-center';
                 statusIcon.innerHTML = getOpenPrStatusIcon(pr.ciStatus);
 
-                statusWrap.appendChild(statusBadge);
-                statusWrap.appendChild(statusIcon);
-
-                // ── Restart CI button ──────────────────────────────
-                if (pr.workflowRunIds && pr.workflowRunIds.length > 0 &&
-                    (pr.ciStatus === 'test_fail' || pr.ciStatus === 'error' || pr.ciStatus === 'pending')) {
-                    const restartBtn = document.createElement('button');
-                    restartBtn.className = 'btn-link color-fg-muted';
-                    restartBtn.type = 'button';
-                    restartBtn.style.cssText = 'background:none;border:none;padding:0 2px;cursor:pointer;line-height:0;';
-                    restartBtn.title = pr.ciStatus === 'test_fail' ? 'Re-run failed jobs' : 'Re-run all jobs';
-                    restartBtn.innerHTML = OCTICONS.sync;
-                    restartBtn.addEventListener('click', async (event) => {
+                if (canRestart) {
+                    statusIcon.type = 'button';
+                    statusIcon.style.cssText = 'background:none;border:none;padding:0;cursor:pointer;line-height:0;';
+                    statusIcon.title = iconLabel;
+                    statusIcon.addEventListener('click', async (event) => {
                         event.preventDefault();
                         event.stopPropagation();
-                        restartBtn.querySelector('svg').classList.add('anim-rotate');
-                        restartBtn.style.pointerEvents = 'none';
+                        statusIcon.querySelector('svg').classList.add('anim-rotate');
+                        statusIcon.style.pointerEvents = 'none';
                         try {
                             const parsed = parseGithubUrl(pr.url);
                             const repo = parsed ? parsed.repo : '';
                             const failedOnly = pr.ciStatus === 'test_fail';
                             // Rerun the most recent workflow run
                             await rerunWorkflow(repo, pr.workflowRunIds[0], failedOnly);
-                            restartBtn.title = 'Triggered!';
-                            setTimeout(() => { restartBtn.title = 'Re-run'; }, 2000);
+                            statusIcon.title = 'Triggered!';
+                            setTimeout(() => { statusIcon.title = iconLabel; }, 2000);
                         } catch (e) {
-                            restartBtn.title = `Failed: ${e.message}`;
+                            statusIcon.title = `Failed: ${e.message}`;
                         } finally {
-                            restartBtn.querySelector('svg').classList.remove('anim-rotate');
-                            restartBtn.style.pointerEvents = '';
+                            statusIcon.querySelector('svg').classList.remove('anim-rotate');
+                            statusIcon.style.pointerEvents = '';
                         }
                     });
-                    statusWrap.appendChild(restartBtn);
                 }
-                // ───────────────────────────────────────────────────
 
+                statusWrap.appendChild(statusBadge);
+                statusWrap.appendChild(statusIcon);
                 iconDiv.appendChild(statusWrap);
             }
 
