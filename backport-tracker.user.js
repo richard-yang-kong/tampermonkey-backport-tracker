@@ -699,6 +699,72 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         return results;
     }
 
+    // Rails scopes each authenticity token to one path + method, and GitHub's
+    // React pages no longer carry a reusable global <meta name="csrf-token">.
+    // So read the token from the run page, which renders (or embeds) the very
+    // re-run form we are about to submit.
+    async function getRerunAuthenticityToken(repo, runId, prNumber) {
+        const pageUrl = `https://github.com/${repo}/actions/runs/${runId}`
+            + (prNumber ? `?pr=${prNumber}` : '');
+        const resp = await fetch(pageUrl, { headers: { Accept: 'text/html' } });
+        if (!resp.ok) return null;
+        const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
+
+        const formInput = doc.querySelector('form[action*="rerequest_check_suite"] input[name="authenticity_token"]');
+        if (formInput && formInput.value) return formInput.value;
+
+        // React pages embed the token instead of rendering the form. Two shapes
+        // show up: a path->token map keyed by the route, or a token field
+        // sitting next to the re-run URL in the same object.
+        const TOKEN_KEY = /csrf|authenticity|token/i;
+        for (const script of doc.querySelectorAll('script[type="application/json"]')) {
+            if (!script.textContent.includes('rerequest_check_suite')) continue;
+            let data;
+            try { data = JSON.parse(script.textContent); } catch (_) { continue; }
+
+            let found = null;
+            (function search(obj) {
+                if (found || !obj || typeof obj !== 'object') return;
+
+                let urlSibling = false;
+                for (const key in obj) {
+                    if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+                    const value = obj[key];
+
+                    if (key.includes('rerequest_check_suite')) {
+                        if (typeof value === 'string') { found = value; return; }
+                        if (value && typeof value === 'object') {
+                            const token = value.put || value.post
+                                || Object.values(value).find(v => typeof v === 'string');
+                            if (token) { found = token; return; }
+                        }
+                    }
+                    if (typeof value === 'string' && value.includes('rerequest_check_suite')) {
+                        urlSibling = true;
+                    }
+                }
+
+                if (urlSibling) {
+                    for (const key in obj) {
+                        if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+                        if (TOKEN_KEY.test(key) && typeof obj[key] === 'string' && obj[key]) {
+                            found = obj[key];
+                            return;
+                        }
+                    }
+                }
+
+                for (const key in obj) {
+                    if (Object.prototype.hasOwnProperty.call(obj, key)) search(obj[key]);
+                }
+            })(data);
+            if (found) return found;
+        }
+
+        const meta = doc.querySelector('meta[name="csrf-token"]');
+        return meta && meta.content ? meta.content : null;
+    }
+
     async function rerunWorkflow(repo, runId, prNumber, failedOnly = true) {
         // GitHub's website does NOT expose the documented REST paths
         // (`/actions/runs/{id}/rerun` and `/rerun-failed-jobs`) as session
@@ -707,29 +773,35 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         // The PR checks UI's own "Re-run failed jobs" button instead form-POSTs
         // to this route with a Rails method-override body (`_method=put`) plus
         // `authenticity_token` and `only_failed_check_runs`, confirmed from the
-        // browser's actual request — a bare POST with just a CSRF header (no
-        // body) also gets rejected with the same generic error.
+        // browser's actual request.
         const endpoint = failedOnly
         ? `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`
         : `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun`;
-        const csrfMeta = document.querySelector('meta[name="csrf-token"]');
-        const csrf = csrfMeta ? csrfMeta.content : '';
         const sessionUrl = `https://github.com/${repo}/actions/runs/${runId}/rerequest_check_suite`
             + (prNumber ? `?pr=${prNumber}` : '');
-        const body = new URLSearchParams({ _method: 'put', authenticity_token: csrf });
-        if (failedOnly) body.set('only_failed_check_runs', 'true');
-        const resp = await fetch(sessionUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            body: body.toString(),
-        });
-        if (!resp.ok) {
+
+        let sessionOk = false;
+        const csrf = await getRerunAuthenticityToken(repo, runId, prNumber);
+        if (csrf) {
+            const body = new URLSearchParams({ _method: 'put', authenticity_token: csrf });
+            if (failedOnly) body.set('only_failed_check_runs', 'true');
+            const resp = await fetch(sessionUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: body.toString(),
+            });
+            sessionOk = resp.ok;
+        }
+
+        if (!sessionOk) {
             // Fallback: use the GitHub API with a PAT if session auth fails
             // You can store a PAT in GM_getValue/GM_setValue
             const token = await GM_getValue('github_pat', '');
-            if (!token) throw new Error('No auth available. Set a PAT via script settings.');
+            if (!token) {
+                throw new Error(csrf ? 'Re-run rejected by GitHub' : 'No CSRF token found');
+            }
             const apiResp = await fetch(endpoint, {
                 method: 'POST',
                 headers: {
