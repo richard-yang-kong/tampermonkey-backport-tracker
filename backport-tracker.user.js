@@ -36,6 +36,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     const PREFIX = "[Backport Tracker]";
     const DEBUG = false;
     const FAILED_CHECK_STATES = ['FAILURE', 'ERROR', 'TIMED_OUT', 'ACTION_REQUIRED'];
+    const RUNNING_POLL_MS = 60000;
 
     // =====================================================================
     // Icons
@@ -903,6 +904,16 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         return document.visibilityState === 'visible' && !document.hidden;
     }
 
+    // True while at least one row still has CI in flight. Manager approval is
+    // deliberately not included — it waits on a person, not on a job, so it
+    // would keep the poll running for days.
+    function hasRunningCi() {
+        return backportData.some(entry =>
+            entry.hasPR && !entry.merged && !entry.closed &&
+            (entry.ciStatus === 'pending' || entry.ciStatus === 'fetching')
+        );
+    }
+
     function waitBeforeRetry(retryCount) {
         const delay = Math.min(250 * (retryCount + 1), 1500);
         return new Promise(resolve => setTimeout(resolve, delay));
@@ -1307,6 +1318,13 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
 
                             statusIcon.title = `Triggered ${triggered}/${runIds.length}`;
                             setTimeout(() => { statusIcon.title = iconLabel; }, 2000);
+
+                            // Give GitHub a moment to requeue the jobs, then pick
+                            // up the new state so the row flips to RUNNING and the
+                            // background poll takes it from there.
+                            setTimeout(() => {
+                                if (lastPrContext) refreshScan(lastPrContext, { silent: true });
+                            }, 5000);
                         } catch (e) {
                             statusIcon.title = `Failed: ${e.message}`;
                         } finally {
@@ -1608,20 +1626,25 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     }
 
     // Refresh button handler: reset state and re-run the scan in-place
-    // (no page reload, no DOM removal — just clear data and re-scan)
-    async function refreshScan(prContext) {
+    // (no page reload, no DOM removal — just clear data and re-scan).
+    // A silent refresh keeps the current rows on screen while it re-scans and
+    // swaps in the new data at the end, so a background poll does not flicker.
+    async function refreshScan(prContext, options = {}) {
         if (isScanning) return;
 
-        backportData = [];
-        lastPrState  = "";
+        const silent = options.silent === true;
         lastScanSettled = false;
 
-        renderLoadingListUI(prContext.isBackport ? 'Looking up original PR...' : 'Looking up backports...');
+        if (!silent) {
+            backportData = [];
+            lastPrState  = "";
+            renderLoadingListUI(prContext.isBackport ? 'Looking up original PR...' : 'Looking up backports...');
+        }
 
         try {
             isScanning = true;
             setRefreshButtonLoading(true);
-            await attemptAutoScan(0, prContext);
+            await attemptAutoScan(0, prContext, { keepExistingUi: silent });
             lastScanSettled = true;
         } finally {
             setRefreshButtonLoading(false);
@@ -1659,6 +1682,17 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         if (lastPrContext && lastPrContext.isBackport) return;
         init();
     }, 5000); // safety-net poll
+
+    // Re-scan while CI is still running so the rows settle on their own.
+    // A scan costs several requests, so it only runs on a visible tab and
+    // only while something is actually in flight.
+    setInterval(() => {
+        if (!shouldRunSafetyPoll()) return;
+        if (isScanning || !lastPrContext) return;
+        if (!document.getElementById('backport-tracker-section')) return;
+        if (!hasRunningCi()) return;
+        refreshScan(lastPrContext, { silent: true });
+    }, RUNNING_POLL_MS);
 
     // Fast SPA navigation detection.
     // GitHub uses Turbo — these events fire when React renders new page content.
