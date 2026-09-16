@@ -35,6 +35,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     let lastScanSettled = false;
     const PREFIX = "[Backport Tracker]";
     const DEBUG = false;
+    const FAILED_CHECK_STATES = ['FAILURE', 'ERROR', 'TIMED_OUT', 'ACTION_REQUIRED'];
 
     // =====================================================================
     // Icons
@@ -450,6 +451,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             const jsonData = await apiResp.json();
             let foundChecks = [];
             let workflowRunIds = new Set();
+            let failedWorkflowRunIds = new Set();
 
             if (jsonData && Array.isArray(jsonData.statusChecks)) {
                 jsonData.statusChecks.forEach(check => {
@@ -459,14 +461,17 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                         // Run IDs can show up under different field names across GitHub UI
                         // versions (targetUrl, detailsUrl, nested workflow-run objects, ...),
                         // so scan every string in the check rather than one fixed field.
+                        const isFailedCheck = FAILED_CHECK_STATES.includes(st.toUpperCase());
                         for (const runId of findWorkflowRunIdsInValue(check)) {
                             workflowRunIds.add(runId);
+                            if (isFailedCheck) failedWorkflowRunIds.add(runId);
                         }
                     }
                 });
             }
 
             result.workflowRunIds = [...workflowRunIds];
+            result.failedWorkflowRunIds = [...failedWorkflowRunIds];
 
             if (foundChecks.length > 0) {
                 let run = 0, fail = 0, pass = 0;
@@ -477,7 +482,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 foundChecks.forEach(c => {
                     const isMgr = c.name.includes("manager approval");
                     const isPass = ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(c.state);
-                    const isFail = ['FAILURE', 'ERROR', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(c.state);
+                    const isFail = FAILED_CHECK_STATES.includes(c.state);
                     if (isMgr) {
                         hasManagerCheck = true;
                         mgrJumpUrl = c.url || mgrJumpUrl;
@@ -1279,9 +1284,25 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                             const parsed = parseGithubUrl(pr.url);
                             const repo = parsed ? parsed.repo : '';
                             const failedOnly = pr.ciStatus === 'test_fail';
-                            // Rerun the most recent workflow run
-                            await rerunWorkflow(repo, pr.workflowRunIds[0], pr.id, failedOnly);
-                            statusIcon.title = 'Triggered!';
+                            // A PR usually spreads its checks over several workflow
+                            // runs, so rerun every affected run, not just the first.
+                            const runIds = failedOnly && pr.failedWorkflowRunIds && pr.failedWorkflowRunIds.length > 0
+                                ? pr.failedWorkflowRunIds
+                                : pr.workflowRunIds;
+
+                            let triggered = 0;
+                            let lastError = null;
+                            for (const runId of runIds) {
+                                try {
+                                    await rerunWorkflow(repo, runId, pr.id, failedOnly);
+                                    triggered++;
+                                } catch (e) {
+                                    lastError = e;
+                                }
+                            }
+                            if (triggered === 0) throw lastError || new Error('No run was restarted');
+
+                            statusIcon.title = `Triggered ${triggered}/${runIds.length}`;
                             setTimeout(() => { statusIcon.title = iconLabel; }, 2000);
                         } catch (e) {
                             statusIcon.title = `Failed: ${e.message}`;
