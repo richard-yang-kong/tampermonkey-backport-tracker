@@ -699,15 +699,21 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         return results;
     }
 
-    async function rerunWorkflow(repo, runId, failedOnly = true) {
-        const sessionPath = failedOnly ? 'rerun-failed-jobs' : 'rerun';
+    async function rerunWorkflow(repo, runId, prNumber, failedOnly = true) {
+        // GitHub's website does NOT expose the documented REST paths
+        // (`/actions/runs/{id}/rerun` and `/rerun-failed-jobs`) as session
+        // routes — POSTing to them returns a generic "Oh no, your browser did
+        // something unexpected" error page (422), not a real API response.
+        // The PR checks UI's own "Re-run failed jobs" button instead hits
+        // this route, confirmed via the browser network tab.
         const endpoint = failedOnly
         ? `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`
         : `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun`;
-        // GitHub session-based fetch (works because you're on github.com)
         const csrfMeta = document.querySelector('meta[name="csrf-token"]');
         const csrf = csrfMeta ? csrfMeta.content : '';
-        const resp = await fetch(`https://github.com/${repo}/actions/runs/${runId}/${sessionPath}`, {
+        const sessionUrl = `https://github.com/${repo}/actions/runs/${runId}/rerequest_check_suite`
+            + (prNumber ? `?pr=${prNumber}` : '');
+        const resp = await fetch(sessionUrl, {
             method: 'POST',
             headers: {
                 'Accept': 'text/html',
@@ -1198,7 +1204,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                             const repo = parsed ? parsed.repo : '';
                             const failedOnly = pr.ciStatus === 'test_fail';
                             // Rerun the most recent workflow run
-                            await rerunWorkflow(repo, pr.workflowRunIds[0], failedOnly);
+                            await rerunWorkflow(repo, pr.workflowRunIds[0], pr.id, failedOnly);
                             statusIcon.title = 'Triggered!';
                             setTimeout(() => { statusIcon.title = iconLabel; }, 2000);
                         } catch (e) {
