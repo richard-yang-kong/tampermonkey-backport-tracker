@@ -678,13 +678,14 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     }
 
     async function rerunWorkflow(repo, runId, failedOnly = true) {
+        const sessionPath = failedOnly ? 'rerun-failed-jobs' : 'rerun';
         const endpoint = failedOnly
         ? `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`
         : `https://api.github.com/repos/${repo}/actions/runs/${runId}/rerun`;
         // GitHub session-based fetch (works because you're on github.com)
         const csrfMeta = document.querySelector('meta[name="csrf-token"]');
         const csrf = csrfMeta ? csrfMeta.content : '';
-        const resp = await fetch(`https://github.com/${repo}/actions/runs/${runId}/rerun`, {
+        const resp = await fetch(`https://github.com/${repo}/actions/runs/${runId}/${sessionPath}`, {
             method: 'POST',
             headers: {
                 'Accept': 'text/html',
