@@ -361,6 +361,25 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         return found;
     }
 
+    // Collect the reviewers whose current review state is "approved".
+    //
+    // The sidebar renders one tooltip per reviewer holding that reviewer's
+    // latest state, so it already collapses repeat reviews and drops approvals
+    // that were dismissed or replaced by a plain comment. Counting the timeline
+    // instead would over-report: a reviewer who approves twice appears twice,
+    // and a dismissed approval still shows up there.
+    function findApproversInDoc(rootDoc) {
+        const approvers = new Map();
+        for (const tip of rootDoc.querySelectorAll('tool-tip[for^="review-status-"]')) {
+            const text = (tip.textContent || '').trim();
+            if (!/approved these changes/i.test(text)) continue;
+            const reviewer = tip.getAttribute('for').replace(/^review-status-/, '');
+            const name = text.replace(/\s*approved these changes\s*$/i, '').trim();
+            approvers.set(reviewer, name || reviewer);
+        }
+        return [...approvers.values()];
+    }
+
     // =====================================================================
     // Fetch PR state + CI status (unchanged from original)
     // =====================================================================
@@ -429,6 +448,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             title,
             baseBranch,
             headBranch,
+            approvers: findApproversInDoc(doc),
             isBackportPr: isBackportPrCandidate({ title, baseBranch, headBranch }),
         };
 
@@ -1072,7 +1092,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     const parsed = parseGithubUrl(pr.url);
                     if (!parsed) continue;
                     const info = await getPrStatus(parsed.repo, parsed.prNumber);
-                    Object.assign(pr, { merged: info.merged, closed: info.closed, ciStatus: info.ciStatus, jumpUrl: info.jumpUrl, tooltip: info.tooltip });
+                    Object.assign(pr, { merged: info.merged, closed: info.closed, ciStatus: info.ciStatus, jumpUrl: info.jumpUrl, tooltip: info.tooltip, approvers: info.approvers });
                     if (!keepExistingUi) {
                         backportData = nextData;
                         renderListUI();
@@ -1269,6 +1289,22 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 statusWrap.className = 'd-flex flex-items-center';
                 statusWrap.style.gap = '4px';
 
+                // Approval count, with the approvers named on hover.
+                const approvers = pr.approvers || [];
+                const approvalBadge = document.createElement('span');
+                approvalBadge.className = 'd-flex flex-items-center';
+                approvalBadge.style.cssText = 'gap:1px;font-size:0.85em;'
+                    + (approvers.length > 0 ? 'color:var(--color-success-fg);' : 'color:var(--color-fg-muted);');
+                approvalBadge.title = approvers.length > 0
+                    ? `Approved by ${approvers.join(', ')}`
+                    : 'No approvals yet';
+                // Drop the hardcoded colour class so the icon follows the
+                // count's colour instead of always rendering green.
+                approvalBadge.innerHTML = OCTICONS.check.replace('color-fg-success', '');
+                const approvalCount = document.createElement('span');
+                approvalCount.textContent = approvers.length;
+                approvalBadge.appendChild(approvalCount);
+
                 const statusBadge = document.createElement('span');
                 statusBadge.textContent = getOpenPrStatusLabel(pr.ciStatus);
                 statusBadge.style.cssText = getOpenPrStatusBadgeStyle(pr.ciStatus);
@@ -1347,6 +1383,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     });
                 }
 
+                statusWrap.appendChild(approvalBadge);
                 statusWrap.appendChild(statusBadge);
                 statusWrap.appendChild(statusIcon);
                 iconDiv.appendChild(statusWrap);
