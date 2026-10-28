@@ -91,7 +91,7 @@
 | `test_fail` | `FAIL` + ✕（点击弹出失败 checks 列表，可跳转 CI 结果，并可 Re-run failed jobs） | 红色 |
 | `ma_pending` | `WAITING MA` + 盾牌 | 黄色 |
 | `success` | `PASS` + ✓ | 绿色 |
-| `pending` | `RUNNING` + 圆点 | 黄色 |
+| `pending` | `RUNNING` + 圆点（点击弹出仍在运行/排队的 checks 列表，可跳转 CI 结果，不会触发 rerun） | 黄色 |
 | `error` | `ERROR` + 感叹号三角 | 红色 |
 | `closed` | 半透明 ✕ | — |
 | `merged` | Merged 标签 + ✓ | 紫/绿 |

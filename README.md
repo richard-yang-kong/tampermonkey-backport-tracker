@@ -10,6 +10,7 @@ Tampermonkey userscript for GitHub pull requests. It adds a compact backport pan
 - Highlights missing backport PRs for labeled target branches.
 - Shows approved / required approvals (for example `1/2`) on each open backport. The required count comes from the PR's "Review required" item and defaults to 2 when GitHub does not report it.
 - Clicking the red `FAIL` icon opens a bubble that lists the failed checks, each linking to its CI results, plus a **Re-run failed jobs** button.
+- Clicking the `RUNNING` dot opens a bubble that lists the checks still queued or in progress, each linking to its CI results. It does not re-run anything.
 - Adds **Copy summary** and **Copy unmerged** actions for quick status sharing.
 - Handles GitHub SPA navigation and sidebar re-renders without a full page refresh.
 

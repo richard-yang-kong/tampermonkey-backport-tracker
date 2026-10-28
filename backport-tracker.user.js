@@ -555,6 +555,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             result.workflowRunIds = [...workflowRunIds];
             result.failedWorkflowRunIds = [...failedWorkflowRunIds];
             result.failedChecks = [];
+            result.runningChecks = [];
 
             if (foundChecks.length > 0) {
                 let run = 0, fail = 0, pass = 0;
@@ -572,17 +573,20 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                         if (isPass) hasApprovedManagerCheck = true;
                         else hasPendingManagerCheck = true;
                     } else {
+                        const listed = {
+                            name: c.displayName,
+                            state: c.state,
+                            url: c.url && c.url.startsWith('/') ? `https://github.com${c.url}` : c.url,
+                        };
                         if (isFail) {
                             fail++;
-                            result.failedChecks.push({
-                                name: c.displayName,
-                                url: c.url && c.url.startsWith('/') ? `https://github.com${c.url}` : c.url,
-                            });
+                            result.failedChecks.push(listed);
                             if (!testAttentionUrl && c.url) testAttentionUrl = c.url;
                         } else if (isPass) {
                             pass++;
                         } else {
                             run++;
+                            result.runningChecks.push(listed);
                             if (!testAttentionUrl && c.url) testAttentionUrl = c.url;
                         }
                     }
@@ -1337,33 +1341,48 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     }
 
     // =====================================================================
-    // FAILED CHECKS BUBBLE: opened from the red X of a failing backport.
-    // Lives on <body> so the sidebar cannot clip it.
+    // CHECKS BUBBLE: opened from the status icon of a backport. On FAIL it
+    // lists the failed checks with a "re-run failed" button; on RUNNING it
+    // lists the checks still in flight. Lives on <body> so the sidebar
+    // cannot clip it.
     // =====================================================================
-    let failedChecksPopover = null; // { el, anchor, pr, busy, cleanup }
+    const CHECKS_POPOVER_KINDS = {
+        failed: { title: 'Failed checks', checksKey: 'failedChecks', icon: OCTICONS.x, empty: 'GitHub did not report which checks failed.' },
+        running: { title: 'Running checks', checksKey: 'runningChecks', icon: OCTICONS.dot, empty: 'GitHub did not report which checks are running.' },
+    };
 
-    function closeFailedChecksPopover() {
-        if (!failedChecksPopover) return;
-        failedChecksPopover.cleanup();
-        failedChecksPopover.el.remove();
-        failedChecksPopover = null;
+    // Which bubble a row's status icon opens, if any.
+    function getChecksPopoverKind(ciStatus) {
+        if (ciStatus === 'test_fail') return 'failed';
+        if (ciStatus === 'pending') return 'running';
+        return null;
     }
 
-    function toggleFailedChecksPopover(anchor, pr) {
-        if (failedChecksPopover && failedChecksPopover.anchor === anchor) {
-            closeFailedChecksPopover();
+    let checksPopover = null; // { el, anchor, pr, kind, busy, cleanup }
+
+    function closeChecksPopover() {
+        if (!checksPopover) return;
+        checksPopover.cleanup();
+        checksPopover.el.remove();
+        checksPopover = null;
+    }
+
+    function toggleChecksPopover(anchor, pr, kind) {
+        if (checksPopover && checksPopover.anchor === anchor) {
+            closeChecksPopover();
             return;
         }
-        openFailedChecksPopover(anchor, pr);
+        openChecksPopover(anchor, pr, kind);
     }
 
-    function openFailedChecksPopover(anchor, pr) {
-        closeFailedChecksPopover();
+    function openChecksPopover(anchor, pr, kind) {
+        closeChecksPopover();
+        const spec = CHECKS_POPOVER_KINDS[kind];
 
         const pop = document.createElement('div');
-        pop.id = 'backport-failed-checks-popover';
+        pop.id = 'backport-checks-popover';
         pop.setAttribute('role', 'dialog');
-        pop.setAttribute('aria-label', `Failed checks of #${pr.id}`);
+        pop.setAttribute('aria-label', `${spec.title} of #${pr.id}`);
         pop.style.cssText = 'position:absolute;z-index:100;width:320px;max-width:calc(100vw - 16px);'
             + 'padding:8px 12px;font-size:12px;border-radius:6px;'
             + 'background:var(--overlay-bgColor, var(--color-canvas-overlay, #fff));'
@@ -1372,16 +1391,16 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         // Keep clicks inside the bubble from reaching GitHub's own handlers.
         pop.addEventListener('click', event => event.stopPropagation());
 
-        const checks = pr.failedChecks || [];
+        const checks = pr[spec.checksKey] || [];
 
         const heading = document.createElement('div');
         heading.className = 'text-bold mb-2';
-        heading.textContent = `Failed checks (${checks.length}) · #${pr.id} ${pr.branch}`;
+        heading.textContent = `${spec.title} (${checks.length}) · #${pr.id} ${pr.branch}`;
         pop.appendChild(heading);
 
         if (checks.length > 0) {
             const list = document.createElement('ul');
-            list.style.cssText = 'list-style:none;margin:0 0 8px;padding:0;max-height:240px;overflow-y:auto;';
+            list.style.cssText = 'list-style:none;margin:0;padding:0;max-height:240px;overflow-y:auto;';
             for (const check of checks) {
                 const item = document.createElement('li');
                 item.className = 'd-flex flex-items-start';
@@ -1389,7 +1408,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
 
                 const icon = document.createElement('span');
                 icon.style.cssText = 'line-height:0;flex-shrink:0;margin-top:1px;';
-                icon.innerHTML = OCTICONS.x;
+                icon.innerHTML = spec.icon;
                 item.appendChild(icon);
 
                 const name = document.createElement(check.url ? 'a' : 'span');
@@ -1403,20 +1422,63 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     name.title = 'Open CI results';
                 }
                 item.appendChild(name);
+
+                // Running checks can be queued or in progress; say which.
+                if (kind === 'running' && check.state) {
+                    const state = document.createElement('span');
+                    state.className = 'color-fg-muted';
+                    state.style.cssText = 'margin-left:auto;padding-left:6px;white-space:nowrap;';
+                    state.textContent = check.state.toLowerCase().replace(/_/g, ' ');
+                    item.appendChild(state);
+                }
                 list.appendChild(item);
             }
             pop.appendChild(list);
         } else {
             const empty = document.createElement('div');
-            empty.className = 'color-fg-muted mb-2';
-            empty.textContent = 'GitHub did not report which checks failed.';
+            empty.className = 'color-fg-muted';
+            empty.textContent = spec.empty;
             pop.appendChild(empty);
         }
 
+        if (kind === 'failed') appendRerunFailedButton(pop, pr);
+
+        document.body.appendChild(pop);
+
+        // Right-align the bubble under the icon, kept inside the viewport.
+        const rect = anchor.getBoundingClientRect();
+        const maxLeft = window.scrollX + document.documentElement.clientWidth - pop.offsetWidth - 8;
+        const left = Math.max(window.scrollX + 8, Math.min(window.scrollX + rect.right - pop.offsetWidth, maxLeft));
+        pop.style.left = `${left}px`;
+        pop.style.top = `${window.scrollY + rect.bottom + 6}px`;
+
+        const onPointerDown = (event) => {
+            if (pop.contains(event.target) || anchor.contains(event.target)) return;
+            closeChecksPopover();
+        };
+        const onKeyDown = (event) => {
+            if (event.key === 'Escape') closeChecksPopover();
+        };
+        const onResize = () => closeChecksPopover();
+        document.addEventListener('mousedown', onPointerDown, true);
+        document.addEventListener('keydown', onKeyDown);
+        window.addEventListener('resize', onResize);
+
+        checksPopover = {
+            el: pop, anchor, pr, kind, busy: false,
+            cleanup: () => {
+                document.removeEventListener('mousedown', onPointerDown, true);
+                document.removeEventListener('keydown', onKeyDown);
+                window.removeEventListener('resize', onResize);
+            },
+        };
+    }
+
+    function appendRerunFailedButton(pop, pr) {
         const canRerun = pr.workflowRunIds && pr.workflowRunIds.length > 0;
         const rerunBtn = document.createElement('button');
         rerunBtn.type = 'button';
-        rerunBtn.className = 'btn btn-sm btn-block';
+        rerunBtn.className = 'btn btn-sm btn-block mt-2';
         rerunBtn.textContent = 'Re-run failed jobs';
         rerunBtn.disabled = !canRerun;
         if (!canRerun) rerunBtn.title = 'No GitHub Actions run found for these checks';
@@ -1430,7 +1492,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         rerunBtn.addEventListener('click', async (event) => {
             event.preventDefault();
             event.stopPropagation();
-            const state = failedChecksPopover;
+            const state = checksPopover;
             if (state) state.busy = true;
             rerunBtn.disabled = true;
             rerunBtn.textContent = 'Re-running…';
@@ -1447,36 +1509,6 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 if (state) state.busy = false;
             }
         });
-
-        document.body.appendChild(pop);
-
-        // Right-align the bubble under the icon, kept inside the viewport.
-        const rect = anchor.getBoundingClientRect();
-        const maxLeft = window.scrollX + document.documentElement.clientWidth - pop.offsetWidth - 8;
-        const left = Math.max(window.scrollX + 8, Math.min(window.scrollX + rect.right - pop.offsetWidth, maxLeft));
-        pop.style.left = `${left}px`;
-        pop.style.top = `${window.scrollY + rect.bottom + 6}px`;
-
-        const onPointerDown = (event) => {
-            if (pop.contains(event.target) || anchor.contains(event.target)) return;
-            closeFailedChecksPopover();
-        };
-        const onKeyDown = (event) => {
-            if (event.key === 'Escape') closeFailedChecksPopover();
-        };
-        const onResize = () => closeFailedChecksPopover();
-        document.addEventListener('mousedown', onPointerDown, true);
-        document.addEventListener('keydown', onKeyDown);
-        window.addEventListener('resize', onResize);
-
-        failedChecksPopover = {
-            el: pop, anchor, pr, busy: false,
-            cleanup: () => {
-                document.removeEventListener('mousedown', onPointerDown, true);
-                document.removeEventListener('keydown', onKeyDown);
-                window.removeEventListener('resize', onResize);
-            },
-        };
     }
 
     // =====================================================================
@@ -1488,13 +1520,13 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
 
         // The rows are about to be rebuilt, so the bubble would point at a
         // detached icon. Close it, and reopen it on the new icon if that PR
-        // still fails. Skip the reopen while a rerun is in flight so the
-        // button cannot be clicked twice.
-        const reopenPopoverFor = failedChecksPopover && !failedChecksPopover.busy
-            ? failedChecksPopover.pr.url
+        // is still in the same state, now with fresh checks. Skip the reopen
+        // while a rerun is in flight so the button cannot be clicked twice.
+        const reopenPopoverFor = checksPopover && !checksPopover.busy
+            ? { url: checksPopover.pr.url, kind: checksPopover.kind }
             : null;
         let reopenPopover = null;
-        closeFailedChecksPopover();
+        closeChecksPopover();
 
         root.innerHTML = "";
 
@@ -1570,32 +1602,35 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 statusBadge.style.cssText = getOpenPrStatusBadgeStyle(pr.ciStatus);
 
                 // On failure the red X opens a bubble listing the failed checks,
-                // which also holds the "re-run failed" action. On error or while
-                // pending, the icon reruns every job directly when we have a
-                // workflow run to target.
-                const isFailed = pr.ciStatus === 'test_fail';
+                // which also holds the "re-run failed" action, and while running
+                // the dot opens one listing the checks still in flight. On error
+                // the icon reruns every job directly when we have a workflow run
+                // to target.
+                const popoverKind = getChecksPopoverKind(pr.ciStatus);
                 const canRestartAll = pr.workflowRunIds && pr.workflowRunIds.length > 0 &&
-                    (pr.ciStatus === 'error' || pr.ciStatus === 'pending');
+                    pr.ciStatus === 'error';
                 const iconLabel = 'Re-run all jobs';
 
-                const statusIcon = document.createElement(isFailed || canRestartAll ? 'button' : 'span');
+                const statusIcon = document.createElement(popoverKind || canRestartAll ? 'button' : 'span');
                 statusIcon.className = 'd-flex flex-items-center';
                 statusIcon.innerHTML = getOpenPrStatusIcon(pr.ciStatus);
 
-                if (isFailed || canRestartAll) {
+                if (popoverKind || canRestartAll) {
                     statusIcon.type = 'button';
                     statusIcon.style.cssText = 'background:none;border:none;padding:0;cursor:pointer;line-height:0;';
                 }
 
-                if (isFailed) {
-                    statusIcon.title = 'Show failed checks';
+                if (popoverKind) {
+                    statusIcon.title = `Show ${CHECKS_POPOVER_KINDS[popoverKind].title.toLowerCase()}`;
                     statusIcon.setAttribute('aria-haspopup', 'dialog');
                     statusIcon.addEventListener('click', (event) => {
                         event.preventDefault();
                         event.stopPropagation();
-                        toggleFailedChecksPopover(statusIcon, pr);
+                        toggleChecksPopover(statusIcon, pr, popoverKind);
                     });
-                    if (reopenPopoverFor === pr.url) reopenPopover = { anchor: statusIcon, pr };
+                    if (reopenPopoverFor && reopenPopoverFor.url === pr.url && reopenPopoverFor.kind === popoverKind) {
+                        reopenPopover = { anchor: statusIcon, pr, kind: popoverKind };
+                    }
                 } else if (canRestartAll) {
                     statusIcon.title = iconLabel;
                     statusIcon.addEventListener('click', async (event) => {
@@ -1638,7 +1673,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         });
 
         root.appendChild(list);
-        if (reopenPopover) openFailedChecksPopover(reopenPopover.anchor, reopenPopover.pr);
+        if (reopenPopover) openChecksPopover(reopenPopover.anchor, reopenPopover.pr, reopenPopover.kind);
 
         // ── Buttons ────────────────────────────────────────────────────────
         const btnRow = document.createElement('div');
@@ -1827,7 +1862,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             needsSectionRestore = false;
             hovercardFetched = false;
             clearInitRetryTimer();
-            closeFailedChecksPopover();
+            closeChecksPopover();
             // Tear down any pending observer from the previous page
             if (domObserver) { domObserver.disconnect(); domObserver = null; }
             clearSidebarObserver();
