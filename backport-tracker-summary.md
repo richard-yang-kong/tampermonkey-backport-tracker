@@ -101,10 +101,10 @@
 - **Copy summary**：复制所有 backport PR 的状态摘要
 - **Copy unmerged**：只复制还未 merge 的 open PR
 
-复制格式（open PR 额外带上 approved/requested reviewer 数，例如 `1/2`）：
+复制格式（open PR 额外带上 approved/required 数，例如 `1/2`；required 取自 PR 的 "Review required"，取不到时默认为 2）：
 ```
 {PR 标题}
-[STATUS] branch (approved/requested): https://github.com/.../pull/...
+[STATUS] branch (approved/required): https://github.com/.../pull/...
 [MERGED] branch: https://github.com/.../pull/...
 ```
 

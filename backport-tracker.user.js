@@ -380,19 +380,51 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         return [...approvers.values()];
     }
 
-    // Count everyone listed under "Reviewers". Reviewers who already reviewed
-    // carry a review-status-<login> element and pending requests carry an
-    // awaiting-review-<login> one. Someone re-requested after reviewing can
-    // have both, so key by login.
-    function countReviewersInDoc(rootDoc) {
-        const reviewers = new Set();
-        const selector = '[id^="review-status-"], [id^="awaiting-review-"], '
-            + 'tool-tip[for^="review-status-"], tool-tip[for^="awaiting-review-"]';
-        for (const el of rootDoc.querySelectorAll(selector)) {
-            const ref = el.getAttribute('for') || el.id;
-            reviewers.add(ref.replace(/^(?:review-status|awaiting-review)-/, ''));
+    // Used when the PR does not tell us how many approvals it needs.
+    const DEFAULT_REQUIRED_APPROVALS = 2;
+
+    // GitHub states the requirement as "At least 2 approving reviews are
+    // required by reviewers with write access" in the merge box's "Review
+    // required" item, and as "At least 1 approving review is required to merge
+    // this pull request" under the sidebar reviewers.
+    const REQUIRED_APPROVALS_TEXT = /at least (\d+) approving reviews? (?:is|are) required/i;
+
+    // Look for the requirement in a JSON payload: either the sentence above
+    // inside some string, or a numeric field such as requiredApprovingReviewCount.
+    function findRequiredApprovalsInValue(value) {
+        let found = null;
+        (function search(obj) {
+            if (found !== null || !obj || typeof obj !== 'object') return;
+            for (const key in obj) {
+                if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+                const v = obj[key];
+                if (typeof v === 'string') {
+                    const m = v.match(REQUIRED_APPROVALS_TEXT);
+                    if (m) { found = Number(m[1]); return; }
+                } else if (Number.isInteger(v) && v >= 0 && /required/i.test(key) && /approv|review/i.test(key)) {
+                    found = v;
+                    return;
+                }
+            }
+            for (const key in obj) {
+                if (Object.prototype.hasOwnProperty.call(obj, key)) search(obj[key]);
+            }
+        })(value);
+        return found;
+    }
+
+    function findRequiredApprovalsInDoc(rootDoc) {
+        const m = (rootDoc.body ? rootDoc.body.textContent : '').match(REQUIRED_APPROVALS_TEXT);
+        if (m) return Number(m[1]);
+
+        for (const script of rootDoc.querySelectorAll('script[type="application/json"]')) {
+            if (!/required/i.test(script.textContent)) continue;
+            try {
+                const found = findRequiredApprovalsInValue(JSON.parse(script.textContent));
+                if (found !== null) return found;
+            } catch (_) {}
         }
-        return reviewers.size;
+        return null;
     }
 
     // =====================================================================
@@ -464,11 +496,14 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             baseBranch,
             headBranch,
             approvers: findApproversInDoc(doc),
-            reviewerCount: countReviewersInDoc(doc),
+            requiredApprovals: findRequiredApprovalsInDoc(doc),
             isBackportPr: isBackportPrCandidate({ title, baseBranch, headBranch }),
         };
 
-        if (state !== 'OPEN') return result;
+        if (state !== 'OPEN') {
+            if (result.requiredApprovals === null) result.requiredApprovals = DEFAULT_REQUIRED_APPROVALS;
+            return result;
+        }
 
         const clientVersionMeta = doc.querySelector('meta[name="expected-client-version"]');
         const clientVersion = clientVersionMeta ? clientVersionMeta.content : "";
@@ -480,6 +515,16 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             "X-Requested-With": "XMLHttpRequest",
         };
         if (clientVersion) fetchHeaders["x-github-client-version"] = clientVersion;
+
+        // A fetched PR page does not include the merge box, which GitHub
+        // loads separately, so ask for its data when the page had no answer.
+        // Runs alongside the status-checks request below.
+        const requiredApprovalsPromise = result.requiredApprovals !== null
+            ? Promise.resolve(result.requiredApprovals)
+            : fetch(`${prUrl}/page_data/merge_box`, { headers: fetchHeaders })
+                .then(resp => (resp.ok ? resp.json() : null))
+                .then(data => (data ? findRequiredApprovalsInValue(data) : null))
+                .catch(() => null);
 
         try {
             const apiResp = await fetch(`${prUrl}/page_data/status_checks`, { headers: fetchHeaders });
@@ -574,6 +619,9 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             result.ciStatus = 'error';
             result.tooltip = `Failed to fetch CI: ${e.message}`;
         }
+
+        const requiredApprovals = await requiredApprovalsPromise;
+        result.requiredApprovals = requiredApprovals !== null ? requiredApprovals : DEFAULT_REQUIRED_APPROVALS;
 
         return result;
     }
@@ -1113,7 +1161,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     const parsed = parseGithubUrl(pr.url);
                     if (!parsed) continue;
                     const info = await getPrStatus(parsed.repo, parsed.prNumber);
-                    Object.assign(pr, { merged: info.merged, closed: info.closed, ciStatus: info.ciStatus, jumpUrl: info.jumpUrl, tooltip: info.tooltip, approvers: info.approvers, reviewerCount: info.reviewerCount });
+                    Object.assign(pr, { merged: info.merged, closed: info.closed, ciStatus: info.ciStatus, jumpUrl: info.jumpUrl, tooltip: info.tooltip, approvers: info.approvers, requiredApprovals: info.requiredApprovals });
                     if (!keepExistingUi) {
                         backportData = nextData;
                         renderListUI();
@@ -1251,11 +1299,10 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         renderListUI();
     }
 
-    // "approved/requested", e.g. "1/2". Approvers always appear in the
-    // reviewer list, so the total never drops below the approved count.
+    // "approved/required", e.g. "1/2".
     function formatApprovalRatio(pr) {
-        const approved = (pr.approvers || []).length;
-        return `${approved}/${Math.max(pr.reviewerCount || 0, approved)}`;
+        const required = pr.requiredApprovals != null ? pr.requiredApprovals : DEFAULT_REQUIRED_APPROVALS;
+        return `${(pr.approvers || []).length}/${required}`;
     }
 
     // Re-run the workflow runs behind a PR's checks. A PR usually spreads its
@@ -1502,15 +1549,15 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 statusWrap.className = 'd-flex flex-items-center';
                 statusWrap.style.gap = '4px';
 
-                // Approved / requested reviewers, with the approvers named on hover.
+                // Approved / required approvals, with the approvers named on hover.
                 const approvers = pr.approvers || [];
                 const approvalBadge = document.createElement('span');
                 approvalBadge.className = 'd-flex flex-items-center';
                 approvalBadge.style.cssText = 'gap:1px;font-size:0.85em;'
                     + (approvers.length > 0 ? 'color:var(--color-success-fg);' : 'color:var(--color-fg-muted);');
-                approvalBadge.title = approvers.length > 0
+                approvalBadge.title = (approvers.length > 0
                     ? `Approved by ${approvers.join(', ')}`
-                    : 'No approvals yet';
+                    : 'No approvals yet') + ` (${formatApprovalRatio(pr).split('/')[1]} required)`;
                 // Drop the hardcoded colour class so the icon follows the
                 // count's colour instead of always rendering green.
                 approvalBadge.innerHTML = OCTICONS.check.replace('color-fg-success', '');
