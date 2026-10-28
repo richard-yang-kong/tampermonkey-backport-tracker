@@ -8,6 +8,8 @@ Tampermonkey userscript for GitHub pull requests. It adds a compact backport pan
 - Collects backport PRs from labels, comments, timeline cross-references, and a GitHub PR search fallback.
 - Distinguishes open backport states as `FAIL`, `RUNNING`, `WAITING MA`, and `PASS`.
 - Highlights missing backport PRs for labeled target branches.
+- Shows approved / requested reviewers (for example `1/2`) on each open backport.
+- Clicking the red `FAIL` icon opens a bubble that lists the failed checks, each linking to its CI results, plus a **Re-run failed jobs** button.
 - Adds **Copy summary** and **Copy unmerged** actions for quick status sharing.
 - Handles GitHub SPA navigation and sidebar re-renders without a full page refresh.
 
@@ -47,11 +49,12 @@ For each open backport PR, the script reads GitHub status checks and turns them 
 - **Copy summary**: copies every discovered backport entry.
 - **Copy unmerged**: copies only open backport PRs that are not merged or closed.
 
-Copied lines look like this:
+Copied lines look like this. Open PRs include approved / requested reviewers in parentheses:
 
 ```text
 PR title
-[WAITING MA] next/3.11.x: https://github.com/org/repo/pull/12345
+[WAITING MA] next/3.11.x (1/2): https://github.com/org/repo/pull/12345
+[MERGED] next/3.10.x: https://github.com/org/repo/pull/12340
 ```
 
 ## Scope And Limits

@@ -380,6 +380,21 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         return [...approvers.values()];
     }
 
+    // Count everyone listed under "Reviewers". Reviewers who already reviewed
+    // carry a review-status-<login> element and pending requests carry an
+    // awaiting-review-<login> one. Someone re-requested after reviewing can
+    // have both, so key by login.
+    function countReviewersInDoc(rootDoc) {
+        const reviewers = new Set();
+        const selector = '[id^="review-status-"], [id^="awaiting-review-"], '
+            + 'tool-tip[for^="review-status-"], tool-tip[for^="awaiting-review-"]';
+        for (const el of rootDoc.querySelectorAll(selector)) {
+            const ref = el.getAttribute('for') || el.id;
+            reviewers.add(ref.replace(/^(?:review-status|awaiting-review)-/, ''));
+        }
+        return reviewers.size;
+    }
+
     // =====================================================================
     // Fetch PR state + CI status (unchanged from original)
     // =====================================================================
@@ -449,6 +464,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             baseBranch,
             headBranch,
             approvers: findApproversInDoc(doc),
+            reviewerCount: countReviewersInDoc(doc),
             isBackportPr: isBackportPrCandidate({ title, baseBranch, headBranch }),
         };
 
@@ -478,7 +494,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 jsonData.statusChecks.forEach(check => {
                     const st = check.conclusion || check.state || "";
                     if (check.displayName && st) {
-                        foundChecks.push({ name: check.displayName.toLowerCase(), state: st.toUpperCase(), url: check.targetUrl || null });
+                        foundChecks.push({ name: check.displayName.toLowerCase(), displayName: check.displayName, state: st.toUpperCase(), url: check.targetUrl || null });
                         // Run IDs can show up under different field names across GitHub UI
                         // versions (targetUrl, detailsUrl, nested workflow-run objects, ...),
                         // so scan every string in the check rather than one fixed field.
@@ -493,6 +509,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
 
             result.workflowRunIds = [...workflowRunIds];
             result.failedWorkflowRunIds = [...failedWorkflowRunIds];
+            result.failedChecks = [];
 
             if (foundChecks.length > 0) {
                 let run = 0, fail = 0, pass = 0;
@@ -512,6 +529,10 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     } else {
                         if (isFail) {
                             fail++;
+                            result.failedChecks.push({
+                                name: c.displayName,
+                                url: c.url && c.url.startsWith('/') ? `https://github.com${c.url}` : c.url,
+                            });
                             if (!testAttentionUrl && c.url) testAttentionUrl = c.url;
                         } else if (isPass) {
                             pass++;
@@ -1092,7 +1113,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                     const parsed = parseGithubUrl(pr.url);
                     if (!parsed) continue;
                     const info = await getPrStatus(parsed.repo, parsed.prNumber);
-                    Object.assign(pr, { merged: info.merged, closed: info.closed, ciStatus: info.ciStatus, jumpUrl: info.jumpUrl, tooltip: info.tooltip, approvers: info.approvers });
+                    Object.assign(pr, { merged: info.merged, closed: info.closed, ciStatus: info.ciStatus, jumpUrl: info.jumpUrl, tooltip: info.tooltip, approvers: info.approvers, reviewerCount: info.reviewerCount });
                     if (!keepExistingUi) {
                         backportData = nextData;
                         renderListUI();
@@ -1230,12 +1251,204 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         renderListUI();
     }
 
+    // "approved/requested", e.g. "1/2". Approvers always appear in the
+    // reviewer list, so the total never drops below the approved count.
+    function formatApprovalRatio(pr) {
+        const approved = (pr.approvers || []).length;
+        return `${approved}/${Math.max(pr.reviewerCount || 0, approved)}`;
+    }
+
+    // Re-run the workflow runs behind a PR's checks. A PR usually spreads its
+    // checks over several workflow runs, so rerun every affected run, not just
+    // the first. Resolves with how many runs were restarted.
+    async function rerunPrWorkflows(pr, failedOnly) {
+        const parsed = parseGithubUrl(pr.url);
+        const repo = parsed ? parsed.repo : '';
+        const runIds = failedOnly && pr.failedWorkflowRunIds && pr.failedWorkflowRunIds.length > 0
+            ? pr.failedWorkflowRunIds
+            : pr.workflowRunIds;
+
+        let triggered = 0;
+        let lastError = null;
+        for (const runId of runIds) {
+            try {
+                await rerunWorkflow(repo, runId, pr.id, failedOnly);
+                triggered++;
+            } catch (e) {
+                lastError = e;
+            }
+        }
+        if (triggered === 0) throw lastError || new Error('No run was restarted');
+
+        // Give GitHub a moment to requeue the jobs, then pick up the new state
+        // so the row flips to RUNNING and the background poll takes it from there.
+        setTimeout(() => {
+            if (lastPrContext) refreshScan(lastPrContext, { silent: true });
+        }, 5000);
+
+        return { triggered, total: runIds.length };
+    }
+
+    // =====================================================================
+    // FAILED CHECKS BUBBLE: opened from the red X of a failing backport.
+    // Lives on <body> so the sidebar cannot clip it.
+    // =====================================================================
+    let failedChecksPopover = null; // { el, anchor, pr, busy, cleanup }
+
+    function closeFailedChecksPopover() {
+        if (!failedChecksPopover) return;
+        failedChecksPopover.cleanup();
+        failedChecksPopover.el.remove();
+        failedChecksPopover = null;
+    }
+
+    function toggleFailedChecksPopover(anchor, pr) {
+        if (failedChecksPopover && failedChecksPopover.anchor === anchor) {
+            closeFailedChecksPopover();
+            return;
+        }
+        openFailedChecksPopover(anchor, pr);
+    }
+
+    function openFailedChecksPopover(anchor, pr) {
+        closeFailedChecksPopover();
+
+        const pop = document.createElement('div');
+        pop.id = 'backport-failed-checks-popover';
+        pop.setAttribute('role', 'dialog');
+        pop.setAttribute('aria-label', `Failed checks of #${pr.id}`);
+        pop.style.cssText = 'position:absolute;z-index:100;width:320px;max-width:calc(100vw - 16px);'
+            + 'padding:8px 12px;font-size:12px;border-radius:6px;'
+            + 'background:var(--overlay-bgColor, var(--color-canvas-overlay, #fff));'
+            + 'border:1px solid var(--borderColor-default, var(--color-border-default));'
+            + 'box-shadow:var(--shadow-floating-large, var(--color-shadow-large));';
+        // Keep clicks inside the bubble from reaching GitHub's own handlers.
+        pop.addEventListener('click', event => event.stopPropagation());
+
+        const checks = pr.failedChecks || [];
+
+        const heading = document.createElement('div');
+        heading.className = 'text-bold mb-2';
+        heading.textContent = `Failed checks (${checks.length}) · #${pr.id} ${pr.branch}`;
+        pop.appendChild(heading);
+
+        if (checks.length > 0) {
+            const list = document.createElement('ul');
+            list.style.cssText = 'list-style:none;margin:0 0 8px;padding:0;max-height:240px;overflow-y:auto;';
+            for (const check of checks) {
+                const item = document.createElement('li');
+                item.className = 'd-flex flex-items-start';
+                item.style.cssText = 'gap:6px;padding:2px 0;';
+
+                const icon = document.createElement('span');
+                icon.style.cssText = 'line-height:0;flex-shrink:0;margin-top:1px;';
+                icon.innerHTML = OCTICONS.x;
+                item.appendChild(icon);
+
+                const name = document.createElement(check.url ? 'a' : 'span');
+                name.textContent = check.name;
+                name.style.wordBreak = 'break-word';
+                if (check.url) {
+                    name.href = check.url;
+                    name.target = '_blank';
+                    name.rel = 'noopener noreferrer';
+                    name.className = 'Link--primary';
+                    name.title = 'Open CI results';
+                }
+                item.appendChild(name);
+                list.appendChild(item);
+            }
+            pop.appendChild(list);
+        } else {
+            const empty = document.createElement('div');
+            empty.className = 'color-fg-muted mb-2';
+            empty.textContent = 'GitHub did not report which checks failed.';
+            pop.appendChild(empty);
+        }
+
+        const canRerun = pr.workflowRunIds && pr.workflowRunIds.length > 0;
+        const rerunBtn = document.createElement('button');
+        rerunBtn.type = 'button';
+        rerunBtn.className = 'btn btn-sm btn-block';
+        rerunBtn.textContent = 'Re-run failed jobs';
+        rerunBtn.disabled = !canRerun;
+        if (!canRerun) rerunBtn.title = 'No GitHub Actions run found for these checks';
+        pop.appendChild(rerunBtn);
+
+        const message = document.createElement('div');
+        message.className = 'color-fg-muted mt-1';
+        message.hidden = true;
+        pop.appendChild(message);
+
+        rerunBtn.addEventListener('click', async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const state = failedChecksPopover;
+            if (state) state.busy = true;
+            rerunBtn.disabled = true;
+            rerunBtn.textContent = 'Re-running…';
+            message.hidden = true;
+            try {
+                const { triggered, total } = await rerunPrWorkflows(pr, true);
+                rerunBtn.textContent = `Triggered ${triggered}/${total}`;
+            } catch (e) {
+                rerunBtn.textContent = 'Re-run failed jobs';
+                rerunBtn.disabled = false;
+                message.textContent = `Failed: ${e.message}`;
+                message.hidden = false;
+            } finally {
+                if (state) state.busy = false;
+            }
+        });
+
+        document.body.appendChild(pop);
+
+        // Right-align the bubble under the icon, kept inside the viewport.
+        const rect = anchor.getBoundingClientRect();
+        const maxLeft = window.scrollX + document.documentElement.clientWidth - pop.offsetWidth - 8;
+        const left = Math.max(window.scrollX + 8, Math.min(window.scrollX + rect.right - pop.offsetWidth, maxLeft));
+        pop.style.left = `${left}px`;
+        pop.style.top = `${window.scrollY + rect.bottom + 6}px`;
+
+        const onPointerDown = (event) => {
+            if (pop.contains(event.target) || anchor.contains(event.target)) return;
+            closeFailedChecksPopover();
+        };
+        const onKeyDown = (event) => {
+            if (event.key === 'Escape') closeFailedChecksPopover();
+        };
+        const onResize = () => closeFailedChecksPopover();
+        document.addEventListener('mousedown', onPointerDown, true);
+        document.addEventListener('keydown', onKeyDown);
+        window.addEventListener('resize', onResize);
+
+        failedChecksPopover = {
+            el: pop, anchor, pr, busy: false,
+            cleanup: () => {
+                document.removeEventListener('mousedown', onPointerDown, true);
+                document.removeEventListener('keydown', onKeyDown);
+                window.removeEventListener('resize', onResize);
+            },
+        };
+    }
+
     // =====================================================================
     // RENDER: shows found PRs, missing entries, and two copy buttons
     // =====================================================================
     function renderListUI() {
         const root = document.getElementById('backport-ui-root');
         if (!root) return;
+
+        // The rows are about to be rebuilt, so the bubble would point at a
+        // detached icon. Close it, and reopen it on the new icon if that PR
+        // still fails. Skip the reopen while a rerun is in flight so the
+        // button cannot be clicked twice.
+        const reopenPopoverFor = failedChecksPopover && !failedChecksPopover.busy
+            ? failedChecksPopover.pr.url
+            : null;
+        let reopenPopover = null;
+        closeFailedChecksPopover();
+
         root.innerHTML = "";
 
         const list = document.createElement('div');
@@ -1289,7 +1502,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 statusWrap.className = 'd-flex flex-items-center';
                 statusWrap.style.gap = '4px';
 
-                // Approval count, with the approvers named on hover.
+                // Approved / requested reviewers, with the approvers named on hover.
                 const approvers = pr.approvers || [];
                 const approvalBadge = document.createElement('span');
                 approvalBadge.className = 'd-flex flex-items-center';
@@ -1302,29 +1515,41 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
                 // count's colour instead of always rendering green.
                 approvalBadge.innerHTML = OCTICONS.check.replace('color-fg-success', '');
                 const approvalCount = document.createElement('span');
-                approvalCount.textContent = approvers.length;
+                approvalCount.textContent = formatApprovalRatio(pr);
                 approvalBadge.appendChild(approvalCount);
 
                 const statusBadge = document.createElement('span');
                 statusBadge.textContent = getOpenPrStatusLabel(pr.ciStatus);
                 statusBadge.style.cssText = getOpenPrStatusBadgeStyle(pr.ciStatus);
 
-                // The status icon (the red X on failure, the alert triangle on
-                // error, the amber dot while pending) doubles as the rerun
-                // trigger when we have a workflow run to target — clicking the
-                // icon itself reruns it, instead of a separate adjacent button.
-                const canRestart = pr.workflowRunIds && pr.workflowRunIds.length > 0 &&
-                    (pr.ciStatus === 'test_fail' || pr.ciStatus === 'error' || pr.ciStatus === 'pending');
-                const failedOnly = pr.ciStatus === 'test_fail';
-                const iconLabel = failedOnly ? 'Re-run failed jobs' : 'Re-run all jobs';
+                // On failure the red X opens a bubble listing the failed checks,
+                // which also holds the "re-run failed" action. On error or while
+                // pending, the icon reruns every job directly when we have a
+                // workflow run to target.
+                const isFailed = pr.ciStatus === 'test_fail';
+                const canRestartAll = pr.workflowRunIds && pr.workflowRunIds.length > 0 &&
+                    (pr.ciStatus === 'error' || pr.ciStatus === 'pending');
+                const iconLabel = 'Re-run all jobs';
 
-                const statusIcon = document.createElement(canRestart ? 'button' : 'span');
+                const statusIcon = document.createElement(isFailed || canRestartAll ? 'button' : 'span');
                 statusIcon.className = 'd-flex flex-items-center';
                 statusIcon.innerHTML = getOpenPrStatusIcon(pr.ciStatus);
 
-                if (canRestart) {
+                if (isFailed || canRestartAll) {
                     statusIcon.type = 'button';
                     statusIcon.style.cssText = 'background:none;border:none;padding:0;cursor:pointer;line-height:0;';
+                }
+
+                if (isFailed) {
+                    statusIcon.title = 'Show failed checks';
+                    statusIcon.setAttribute('aria-haspopup', 'dialog');
+                    statusIcon.addEventListener('click', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        toggleFailedChecksPopover(statusIcon, pr);
+                    });
+                    if (reopenPopoverFor === pr.url) reopenPopover = { anchor: statusIcon, pr };
+                } else if (canRestartAll) {
                     statusIcon.title = iconLabel;
                     statusIcon.addEventListener('click', async (event) => {
                         event.preventDefault();
@@ -1332,48 +1557,19 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
 
                         // A full re-run restarts every job in the suite, so it
                         // both costs a lot of CI time and throws away results
-                        // that are still valid. Ask before doing that. Re-running
-                        // only the failed jobs is cheap and needs no prompt.
-                        if (!failedOnly) {
-                            const confirmed = window.confirm(
-                                `Re-run ALL jobs of #${pr.id} (${pr.branch})?\n\n`
-                                + 'This restarts every job in the run, including the ones that already passed.'
-                            );
-                            if (!confirmed) return;
-                        }
+                        // that are still valid. Ask before doing that.
+                        const confirmed = window.confirm(
+                            `Re-run ALL jobs of #${pr.id} (${pr.branch})?\n\n`
+                            + 'This restarts every job in the run, including the ones that already passed.'
+                        );
+                        if (!confirmed) return;
 
                         statusIcon.querySelector('svg').classList.add('anim-rotate');
                         statusIcon.style.pointerEvents = 'none';
                         try {
-                            const parsed = parseGithubUrl(pr.url);
-                            const repo = parsed ? parsed.repo : '';
-                            // A PR usually spreads its checks over several workflow
-                            // runs, so rerun every affected run, not just the first.
-                            const runIds = failedOnly && pr.failedWorkflowRunIds && pr.failedWorkflowRunIds.length > 0
-                                ? pr.failedWorkflowRunIds
-                                : pr.workflowRunIds;
-
-                            let triggered = 0;
-                            let lastError = null;
-                            for (const runId of runIds) {
-                                try {
-                                    await rerunWorkflow(repo, runId, pr.id, failedOnly);
-                                    triggered++;
-                                } catch (e) {
-                                    lastError = e;
-                                }
-                            }
-                            if (triggered === 0) throw lastError || new Error('No run was restarted');
-
-                            statusIcon.title = `Triggered ${triggered}/${runIds.length}`;
+                            const { triggered, total } = await rerunPrWorkflows(pr, false);
+                            statusIcon.title = `Triggered ${triggered}/${total}`;
                             setTimeout(() => { statusIcon.title = iconLabel; }, 2000);
-
-                            // Give GitHub a moment to requeue the jobs, then pick
-                            // up the new state so the row flips to RUNNING and the
-                            // background poll takes it from there.
-                            setTimeout(() => {
-                                if (lastPrContext) refreshScan(lastPrContext, { silent: true });
-                            }, 5000);
                         } catch (e) {
                             statusIcon.title = `Failed: ${e.message}`;
                         } finally {
@@ -1395,6 +1591,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         });
 
         root.appendChild(list);
+        if (reopenPopover) openFailedChecksPopover(reopenPopover.anchor, reopenPopover.pr);
 
         // ── Buttons ────────────────────────────────────────────────────────
         const btnRow = document.createElement('div');
@@ -1485,10 +1682,10 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         const lines = items.map(pr => {
             if (pr.missing) return `[MISSING] ${pr.branch}`;
             if (!pr.hasPR) return `[PENDING] ${pr.branch}`;
-            const status = pr.merged  ? 'MERGED'
-                         : pr.closed  ? 'CLOSED'
-                         : getOpenPrStatusLabel(pr.ciStatus);
-            return `[${status}] ${pr.branch}: ${pr.url}`;
+            if (pr.merged) return `[MERGED] ${pr.branch}: ${pr.url}`;
+            if (pr.closed) return `[CLOSED] ${pr.branch}: ${pr.url}`;
+            // Open PRs also carry approved/requested reviewers, e.g. "(1/2)".
+            return `[${getOpenPrStatusLabel(pr.ciStatus)}] ${pr.branch} (${formatApprovalRatio(pr)}): ${pr.url}`;
         });
 
         const text = mode === 'unmerged'
@@ -1583,6 +1780,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             needsSectionRestore = false;
             hovercardFetched = false;
             clearInitRetryTimer();
+            closeFailedChecksPopover();
             // Tear down any pending observer from the previous page
             if (domObserver) { domObserver.disconnect(); domObserver = null; }
             clearSidebarObserver();

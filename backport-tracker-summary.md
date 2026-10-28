@@ -88,7 +88,7 @@
 | ciStatus | 图标 | 颜色 |
 |---|---|---|
 | `fetching` | `LOADING` + 转动的 sync 图标 | 灰色 |
-| `test_fail` | `FAIL` + ✕ | 红色 |
+| `test_fail` | `FAIL` + ✕（点击弹出失败 checks 列表，可跳转 CI 结果，并可 Re-run failed jobs） | 红色 |
 | `ma_pending` | `WAITING MA` + 盾牌 | 黄色 |
 | `success` | `PASS` + ✓ | 绿色 |
 | `pending` | `RUNNING` + 圆点 | 黄色 |
@@ -101,10 +101,11 @@
 - **Copy summary**：复制所有 backport PR 的状态摘要
 - **Copy unmerged**：只复制还未 merge 的 open PR
 
-复制格式：
+复制格式（open PR 额外带上 approved/requested reviewer 数，例如 `1/2`）：
 ```
 {PR 标题}
-[STATUS] branch: https://github.com/.../pull/...
+[STATUS] branch (approved/requested): https://github.com/.../pull/...
+[MERGED] branch: https://github.com/.../pull/...
 ```
 
 open PR 的状态文案统一为：`FAIL` / `RUNNING` / `WAITING MA` / `PASS`。
