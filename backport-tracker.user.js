@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Backport Tracker
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Track backport PR status; detect label/PR gaps; copy unmerged
 // @author       Stella
 // @match        https://github.com/*/*/pull/*
@@ -37,6 +37,20 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     const DEBUG = false;
     const FAILED_CHECK_STATES = ['FAILURE', 'ERROR', 'TIMED_OUT', 'ACTION_REQUIRED'];
     const RUNNING_POLL_MS = 60000;
+
+    // GitHub's PR "Overview" view (the default since late 2026) renders a
+    // different React tree: no `[data-testid="markdown-body"]`, no state-badge,
+    // and hashed CSS-module classes (e.g. `baseBranchGroup__CJSpgC`), so those
+    // are matched by prefix. `?overview=false` still serves the classic view.
+    const COMMENT_BODY_SEL = '.comment-body, [data-testid="markdown-body"], .markdown-body';
+    const FIRST_COMMENT_SEL = '.comment-body, [data-testid="markdown-body"], section[aria-label="Description"] .markdown-body';
+    const STATE_BADGE_SEL = '#partial-discussion-header .State, .gh-header-meta [data-testid="state-badge"], [data-testid="state-badge"], [class*="prc-PageHeader-PageHeader"] [class*="prc-StateLabel-StateLabel"]';
+
+    // Remote PR pages are always parsed in the classic view, which carries
+    // the review-status tooltips and branch refs the parsers rely on.
+    function classicPullUrl(prUrl) {
+        return `${prUrl}?overview=false`;
+    }
 
     // =====================================================================
     // Icons
@@ -164,8 +178,8 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
 
     function findPrBranchInDoc(rootDoc, type) {
         const selector = type === 'base'
-            ? '[data-testid="base-ref-name"], .base-ref, .commit-ref[title^="Base:"], .commit-ref[data-ref-type="base"]'
-            : '[data-testid="head-ref-name"], .head-ref, .commit-ref[title^="Head:"], .commit-ref[title^="Compare:"], .commit-ref[data-ref-type="head"]';
+            ? '[data-testid="base-ref-name"], .base-ref, .commit-ref[title^="Base:"], .commit-ref[data-ref-type="base"], [class*="baseBranchGroup"] a[href*="/tree/"]'
+            : '[data-testid="head-ref-name"], .head-ref, .commit-ref[title^="Head:"], .commit-ref[title^="Compare:"], .commit-ref[data-ref-type="head"], [class*="headBranchGroup"] a[href*="/tree/"]';
         let branchEl = rootDoc.querySelector(selector);
         if (!branchEl) {
             const refs = rootDoc.querySelectorAll('.commit-ref');
@@ -236,7 +250,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         const headerContainer = document.querySelector(
             '#partial-discussion-header, .gh-header-meta, ' +
             '[data-testid="pr-header"], [data-testid="base-head-compare"], ' +
-            '.js-pull-request-ref-info'
+            '.js-pull-request-ref-info, [class*="prc-PageHeader-PageHeader"]'
         );
         const scope = headerContainer || document;
 
@@ -244,7 +258,8 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             '[data-testid="base-ref-name"], ' +
             '.base-ref, ' +
             '.commit-ref[title^="Base:"], ' +
-            '.commit-ref[data-ref-type="base"]'
+            '.commit-ref[data-ref-type="base"], ' +
+            '[class*="baseBranchGroup"] a[href*="/tree/"]'
         );
         if (!baseBranchEl) {
             // Fallback: GitHub renders base FIRST, head SECOND in the PR header.
@@ -377,6 +392,15 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             const name = text.replace(/\s*approved these changes\s*$/i, '').trim();
             approvers.set(reviewer, name || reviewer);
         }
+        // Overview view: one row per reviewer, with a Primer tooltip span.
+        for (const row of rootDoc.querySelectorAll('section[aria-label="Reviewers"] li')) {
+            const tip = row.querySelector('[class*="prc-TooltipV2-Tooltip"]');
+            const text = (tip?.textContent || '').trim();
+            if (!/approved these changes/i.test(text)) continue;
+            const name = text.replace(/\s*approved these changes\s*$/i, '').trim();
+            const reviewer = row.querySelector('a[href^="/"]')?.getAttribute('href').replace(/^\//, '') || name;
+            approvers.set(reviewer, name || reviewer);
+        }
         return [...approvers.values()];
     }
 
@@ -390,7 +414,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         let doc = document;
         if (!isCurrentPage) {
             try {
-                const resp = await fetch(prUrl, { headers: { "Accept": "text/html" } });
+                const resp = await fetch(classicPullUrl(prUrl), { headers: { "Accept": "text/html" } });
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const html = await resp.text();
                 doc = new DOMParser().parseFromString(html, 'text/html');
@@ -411,7 +435,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         // Used by callers checking backport PR targets.
         // Priority: DOM element → JSON script data (handles React-fetched HTML where elements may be absent)
         const headerBadge = isCurrentPage
-            ? document.querySelector('#partial-discussion-header .State, .gh-header-meta [data-testid="state-badge"], [data-testid="state-badge"]')
+            ? document.querySelector(STATE_BADGE_SEL)
             : doc.querySelector('#partial-discussion-header .State, .gh-header-meta [data-testid="state-badge"]');
         if (headerBadge) {
             const text = headerBadge.textContent.toLowerCase();
@@ -574,6 +598,8 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
             '.js-issue-labels a[data-name]',
             '.IssueLabel[data-name]',
             'a[href*="/labels/backport"]',
+            // Overview view: label tokens link to an issue search, no data-name
+            'section[aria-label="Labels"] a[href*="label%3A"]',
         ];
 
         for (const sel of selectors) {
@@ -646,7 +672,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
         const linkMentionsBackport = (link) => hasBackportToken(getLinkText(link));
 
         // Source 1: comments mentioning "backport"
-        document.querySelectorAll('.comment-body, [data-testid="markdown-body"]').forEach(comment => {
+        document.querySelectorAll(COMMENT_BODY_SEL).forEach(comment => {
             if (!/backport/i.test(comment.textContent)) return;
             const textMatch = comment.textContent.match(BRANCH_IN_TEXT);
             const textBranch = (textMatch && !textMatch[1].startsWith('#')) ? textMatch[1] : null;
@@ -888,16 +914,16 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     }
 
     async function findOriginalPrForBackport(repo, currentPrNumber) {
-        const firstComment = document.querySelector('.comment-body, [data-testid="markdown-body"]');
+        const firstComment = document.querySelector(FIRST_COMMENT_SEL);
         const localCandidate = findOriginalPrInCommentRoot(firstComment, repo, currentPrNumber);
         if (localCandidate) return localCandidate;
 
         try {
-            const resp = await fetch(buildPullUrl(repo, currentPrNumber), { headers: { Accept: 'text/html' } });
+            const resp = await fetch(classicPullUrl(buildPullUrl(repo, currentPrNumber)), { headers: { Accept: 'text/html' } });
             if (!resp.ok) return null;
             const html = await resp.text();
             const doc = new DOMParser().parseFromString(html, 'text/html');
-            const remoteFirstComment = doc.querySelector('.comment-body, [data-testid="markdown-body"]');
+            const remoteFirstComment = doc.querySelector(FIRST_COMMENT_SEL);
             return findOriginalPrInCommentRoot(remoteFirstComment, repo, currentPrNumber);
         } catch (_) {
             return null;
@@ -907,11 +933,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     // Fast state check for the PR we're currently viewing — reads the live DOM
     // directly instead of re-serialising + re-parsing the entire page HTML.
     function getMainPRStateFromDOM() {
-        const badge = document.querySelector(
-            '#partial-discussion-header .State, ' +
-            '[data-testid="state-badge"], ' +
-            '.gh-header-meta .State'
-        );
+        const badge = document.querySelector(STATE_BADGE_SEL + ', .gh-header-meta .State');
         if (!badge) return null;
         const t = badge.textContent.toLowerCase();
         if (t.includes('merged')) return 'MERGED';
@@ -1509,7 +1531,7 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     // MutationObserver-based startup: fires the moment React renders the
     // sidebar and base-branch elements — no fixed-delay retry loops needed.
     // =====================================================================
-    const SIDEBAR_SEL = '.Layout-sidebar, #partial-discussion-sidebar, [id="pr-conversation-sidebar"], [data-testid="sidebar"]';
+    const SIDEBAR_SEL = '.Layout-sidebar, #partial-discussion-sidebar, [id="pr-conversation-sidebar"], [data-testid="sidebar"], [data-testid="sticky-sidebar"]';
     let domObserver = null;
     let sidebarObserver = null;
 
@@ -1729,7 +1751,9 @@ GM_registerMenuCommand('Set GitHub PAT for CI restart', () => {
     init();
     setInterval(() => {
         if (!shouldRunSafetyPoll()) return;
-        if (lastPrContext && lastPrContext.isBackport) return;
+        // Switching between Overview and the classic view keeps the pathname
+        // but swaps the sidebar, so still re-inject when the section is gone.
+        if (lastPrContext && lastPrContext.isBackport && document.getElementById('backport-tracker-section')) return;
         init();
     }, 5000); // safety-net poll
 
